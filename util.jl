@@ -119,3 +119,88 @@ function install_and_use(pspec)
     pkg_root = normpath(joinpath(dirname(pathof(pkg_module)), ".."))
     pkg_module, pkg_root
 end
+
+function run_with_timeout(
+        command, timeout, logfile, name;
+        out_io = IOBuffer(), err_io = IOBuffer(),
+        wait_time = 0.5
+    )
+    pipe = pipeline(command, stdout = out_io, stderr = err_io)
+    process = run(pipe, wait = false)
+    timeout_start = time()
+    logs = Pair{Symbol, String}[]
+    killed = false
+    task = @async begin
+        tstart = time()
+        while process_running(process)
+            elapsed = (time() - timeout_start)
+            if elapsed > timeout
+                @info("killing build for $name")
+                kill(process); killed = true
+                break
+            end
+            is_silent = true
+            if bytesavailable(out_io) > 0
+                push!(logs, :out => read(out_io, String)); is_silent = false
+            end
+            if bytesavailable(err_io) > 0
+                push!(logs, :out => read(err_io, String)); is_silent = false
+            end
+            # if something printed reset timeout
+            if !is_silent
+                println("resetting")
+                timeout_start = time()
+            end
+            sleep(wait_time)
+        end
+        killed || @info("build for $name completed in $(time() - tstart) seconds")
+        println(length(logs))
+        open(logfile, "w") do io
+            for (typ, msg) in logs
+                println(io, typ, ">", msg)
+            end
+        end
+    end
+    return process, task
+end
+
+
+
+function run_process(name, url, version)
+    out_io = Pipe()
+    err_io = Pipe()
+    cmd = `julia --compiled-modules=no --startup-file=no -O0 -g2 worker_work.jl $name $url $version`
+    @info("starting build for $name")
+    process = run(pipeline(cmd, stdout = out_io, stderr = err_io), wait = false)
+    timeout_start = time()
+    buildpath = joinpath(@__DIR__, "build", name)
+    task = @async begin
+        try
+            tstart = time()
+            isdir(buildpath) && rm(buildpath, force = true, recursive = true)
+            mkpath(buildpath)
+            open(joinpath(buildpath, "build.log"), "w") do log
+                while process_running(process)
+                    if (time() - timeout_start) > build_timeout
+                        @info("killing build for $name")
+                        kill(process)
+                        break
+                    end
+                    errstr, outstr = read.((err_io, out_io), (String,))
+                    is_silent = length(errstr) == 0 && length(outstr) == 0
+                    isempty(outstr) || println(log, outstr)
+                    isempty(errstr) || println(log, errstr)
+                    if !is_silent
+                        # if something printed reset timeout
+                        timeout_start = time()
+                    end
+                    sleep(0.5)
+                end
+            end
+            @info("build for $name completed in $(time() - tstart) seconds")
+        catch e
+            @error("Bad stuff!", error = e)
+        end
+    end
+    return process
+end
